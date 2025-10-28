@@ -713,54 +713,60 @@ class HexCanvas:
             self.redraw_grid()
         else:
             messagebox.showwarning("Import", "Import did not succeed.")
-    
+
     def export_json(self):
-        """Export the current grid as JSON."""
+        """Export the current grid as JSON with a hard validation gate."""
         if self.grid is None:
             messagebox.showerror("No Grid", "No grid to export.")
             return
-        
-        # Check validation status
-        validation_errors = self.grid.validate_puzzle()
-        errors = [e for e in validation_errors if e.severity == "error"]
-        warnings = [e for e in validation_errors if e.severity == "warning"]
-        
-        # Show validation summary
+
+        # 1) Run validation
+        validation_errors = self.grid.validate_puzzle()  # returns List[ValidationError]
+        errors = [e for e in validation_errors if getattr(e, "severity", "error") == "error"]
+        warnings = [e for e in validation_errors if getattr(e, "severity", "") == "warning"]
+
+        # 2) Block on errors (NO override)
         if errors:
-            error_details = "\n".join([f"• {e.message}" for e in errors[:5]])
-            if len(errors) > 5:
-                error_details += f"\n... and {len(errors) - 5} more errors"
-            
-            result = messagebox.askyesno("Validation Errors", 
-                                       f"Puzzle has {len(errors)} errors:\n\n{error_details}\n\nExport anyway?")
-            if not result:
+            # Show a concise summary
+            lines = [f"• {e.message}" + (f" @ {e.location}" if getattr(e, "location", None) else "")
+                    for e in errors[:8]]
+            more = f"\n... and {len(errors) - 8} more error(s)" if len(errors) > 8 else ""
+            messagebox.showerror(
+                "Export Blocked — Validation Errors",
+                f"Cannot export: {len(errors)} error(s) detected.\n\n" + "\n".join(lines) + more
+            )
+            return
+
+        # 3) Warn (optional confirm) on warnings
+        if warnings:
+            lines = [f"• {w.message}" + (f" @ {w.location}" if getattr(w, "location", None) else "")
+                    for w in warnings[:5]]
+            more = f"\n... and {len(warnings) - 5} more warning(s)" if len(warnings) > 5 else ""
+            ok = messagebox.askyesno(
+                "Validation Warnings",
+                f"{len(warnings)} warning(s) found.\n\n" + "\n".join(lines) + more + "\n\nContinue export?"
+            )
+            if not ok:
                 return
-        elif warnings:
-            warning_details = "\n".join([f"• {e.message}" for e in warnings[:3]])
-            if len(warnings) > 3:
-                warning_details += f"\n... and {len(warnings) - 3} more warnings"
-            
-            result = messagebox.askyesno("Validation Warnings", 
-                                       f"Puzzle has {len(warnings)} warnings:\n\n{warning_details}\n\nContinue export?")
-            if not result:
-                return
-        
-        # Get filename
+
+        # 4) Pick filename and write
         filename = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
             title="Export Puzzle as JSON"
         )
-        
-        if filename:
-            try:
-                puzzle_id = tk.simpledialog.askstring("Puzzle ID", "Enter puzzle ID:", initialvalue="custom_puzzle")
-                if puzzle_id:
-                    self.grid.save_json(filename, puzzle_id)
-                    messagebox.showinfo("Export Success", f"Puzzle exported to {filename}")
-            except Exception as e:
-                messagebox.showerror("Export Error", f"Failed to export puzzle: {str(e)}")
-    
+        if not filename:
+            return
+
+        try:
+            # Ask for a puzzle id (optional)
+            puzzle_id = tk.simpledialog.askstring("Puzzle ID", "Enter puzzle ID:", initialvalue="custom_puzzle")
+            if puzzle_id:
+                self.grid.save_json(filename, puzzle_id)
+                messagebox.showinfo("Export Success", f"Puzzle exported to:\n{filename}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export puzzle:\n{e}")
+
     def show_validation_report(self):
         """Show detailed validation report."""
         if self.grid is None:

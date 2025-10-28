@@ -506,20 +506,28 @@ class HexGrid:
     
     def validate_puzzle(self) -> List[ValidationError]:
         """
-        Comprehensive puzzle validation.
-        
-        Returns:
-            List of ValidationError objects (empty if valid)
+        Return a list[ValidationError]. Empty list == VALID.
+        Rules (hard errors):
+        - Center invariants (center cannot appear as a graph vertex; must be CENTER state if set)
+        - Adjacency symmetry (for loaded JSON graphs): undirected, no self-loops, endpoints exist
+        - Dot constraints must reference valid edges
+        - Graph connectivity must hold (single component)
+        - Duplicate values are not allowed
+        - Prefilled values must be in range [1..max_value]
         """
-        errors = []
-        
-        # Check connectivity
+        errors: List[ValidationError] = []
+
+        # ---------------------------
+        # A) Connectivity (original)
+        # ---------------------------
         is_connected, conn_msg = self.validate_connectivity()
         if not is_connected:
             errors.append(ValidationError("error", conn_msg))
-        
-        # Check for duplicate values
-        value_locations = {}
+
+        # ---------------------------------------
+        # B) Duplicate values (original feature)
+        # ---------------------------------------
+        value_locations: Dict[int, Tuple[int, int]] = {}
         for (row, col), (state, value) in self.cell_states.items():
             if state == CellState.PREFILLED and value is not None:
                 if value in value_locations:
@@ -530,8 +538,10 @@ class HexGrid:
                     ))
                 else:
                     value_locations[value] = (row, col)
-        
-        # Check value ranges
+
+        # -------------------------------------
+        # C) Value ranges (original feature)
+        # -------------------------------------
         max_val = self.get_max_possible_value()
         for (row, col), (state, value) in self.cell_states.items():
             if state == CellState.PREFILLED and value is not None:
@@ -541,24 +551,183 @@ class HexGrid:
                         f"Value {value} out of range (1-{max_val})",
                         location=(row, col)
                     ))
-        
-        # Check constraint validity (uses active neighbor semantics)
+
+        # -----------------------------------------------------------------
+        # D) Constraint validity (original semantics + tiny safety add)
+        #     - non-existent cells
+        #     - non-adjacent endpoints (active graph semantics)
+        #     - (extra safety) non-playable endpoints
+        # -----------------------------------------------------------------
         for (cell1, cell2) in self.dot_constraints:
             if not self.cell_exists(*cell1) or not self.cell_exists(*cell2):
                 errors.append(ValidationError(
                     "error",
-                    f"Constraint references non-existent cells",
+                    "Constraint references non-existent cells",
                     location=cell1
                 ))
-            elif cell2 not in self.get_neighbors(*cell1):
+                continue
+
+            s1, _ = self.get_cell_state(*cell1)
+            s2, _ = self.get_cell_state(*cell2)
+            if s1 not in (CellState.EMPTY, CellState.PREFILLED) or \
+            s2 not in (CellState.EMPTY, CellState.PREFILLED):
                 errors.append(ValidationError(
                     "error",
-                    f"Invalid constraint between non-adjacent cells",
+                    "Constraint touches non-playable cell",
                     location=cell1
                 ))
-        
+                continue
+
+            if cell2 not in self.get_neighbors(*cell1):
+                errors.append(ValidationError(
+                    "error",
+                    "Invalid constraint between non-adjacent cells",
+                    location=cell1
+                ))
+
+        # -------------------------------------------------------
+        # E) Center invariants (NEW, required for solver-safety)
+        # -------------------------------------------------------
+        center = self.center_location
+        if center is not None:
+            st, _ = self.get_cell_state(*center)
+            if st != CellState.CENTER:
+                errors.append(ValidationError("error", "Center cell is not marked CENTER", location=center))
+
+            # Center must NOT be a graph vertex or neighbor if a loaded graph exists
+            if self.loaded_adjacency is not None:
+                if center in self.loaded_adjacency:
+                    errors.append(ValidationError("error", "Center appears as a vertex in adjacency", location=center))
+                else:
+                    for u, nbrs in self.loaded_adjacency.items():
+                        if center in nbrs:
+                            errors.append(ValidationError("error", "Center appears as a neighbor in adjacency", location=center))
+                            break
+
+        # ------------------------------------------------------------------
+        # F) Adjacency symmetry & well-formedness (NEW, only if graph loaded)
+        # ------------------------------------------------------------------
+        if self.loaded_adjacency is not None:
+            for u, nbrs in self.loaded_adjacency.items():
+                if not self.cell_exists(*u):
+                    errors.append(ValidationError("error", "Adjacency references non-existent cell", location=u))
+                for v in nbrs:
+                    if v == u:
+                        errors.append(ValidationError("error", "Self-loop in adjacency", location=u))
+                        continue
+                    if not self.cell_exists(*v):
+                        errors.append(ValidationError("error", "Adjacency references non-existent neighbor", location=v))
+                        continue
+                    back = self.loaded_adjacency.get(v, set())
+                    if u not in back:
+                        errors.append(ValidationError(
+                            "error",
+                            f"Asymmetric adjacency: {u} → {v} but not {v} → {u}",
+                            location=u
+                        ))
+
         return errors
     
+    # ============================================
+    # VALIDATION: detailed rule implementations
+    # ============================================
+    def _validate_center_invariants(self):
+        """
+        Center cell may exist in the layout as a special marker, but:
+        - It must NOT appear as a graph vertex (no adjacency entry, no membership in any neighbor set)
+        - If present in the grid, its CellState must be CENTER (not playable)
+        """
+        v = []
+        center = self.center_location  # Tuple[int,int] or None
+        if center is None:
+            return v  # Having no center is fine (some Rikudo variants)
+
+        # Must be CENTER state
+        st, _ = self.get_cell_state(*center)
+        if st != CellState.CENTER:
+            v.append(ValidationError("error", "Center cell is not marked CENTER", location=center))
+
+        # Must not be a graph vertex (no key, no appearance in neighbor sets)
+        if self.loaded_adjacency is not None:
+            if center in self.loaded_adjacency:
+                v.append(ValidationError("error", "Center appears as a vertex in adjacency", location=center))
+            else:
+                for u, nbrs in self.loaded_adjacency.items():
+                    if center in nbrs:
+                        v.append(ValidationError("error", "Center appears as a neighbor in adjacency", location=center))
+                        break
+
+        return v
+
+
+    def _validate_adjacency_symmetry(self):
+        """
+        For loaded JSON graphs, enforce undirected symmetry and basic well-formedness:
+        - For every (u -> v), a matching (v -> u) must exist
+        - No self-loops
+        - Endpoints must exist as non-hole cells in the grid
+        """
+        v = []
+
+        # Build quick existence predicate from grid state
+        def exists(cell):
+            r, c = cell
+            return self.cell_exists(r, c)
+
+        for u, nbrs in self.loaded_adjacency.items():
+            # Endpoint must exist
+            if not exists(u):
+                v.append(ValidationError("error", "Adjacency references non-existent cell", location=u))
+                # Continue checking others; collect all errors
+            for w in nbrs:
+                # Self-loop?
+                if w == u:
+                    v.append(ValidationError("error", "Self-loop in adjacency", location=u))
+                    continue
+                # Endpoint must exist
+                if not exists(w):
+                    v.append(ValidationError("error", "Adjacency references non-existent neighbor", location=w))
+                    continue
+                # Symmetry check
+                back = self.loaded_adjacency.get(w, set())
+                if u not in back:
+                    v.append(ValidationError(
+                        "error",
+                        f"Asymmetric adjacency: {u} → {w} but not {w} → {u}",
+                        location=u
+                    ))
+
+        return v
+
+
+    def _validate_constraints_reference_edges(self):
+        """
+        Dot constraints must reference valid edges of the ACTIVE graph:
+        - If a loaded JSON graph exists → check edge ∈ loaded_adjacency
+        - Else → check edge ∈ parity neighbors (get_neighbors)
+        """
+        v = []
+        for (a, b) in self.dot_constraints:
+            # Reject any constraint touching holes/center/non-playable
+            st_a, _ = self.get_cell_state(*a)
+            st_b, _ = self.get_cell_state(*b)
+            if st_a not in (CellState.EMPTY, CellState.PREFILLED) or st_b not in (CellState.EMPTY, CellState.PREFILLED):
+                v.append(ValidationError("error", "Constraint touches non-playable cell", location=a))
+                continue
+
+            # Active-graph edge check
+            if self.loaded_adjacency is not None:
+                nbrs = self.loaded_adjacency.get(a, set())
+                if b not in nbrs:
+                    v.append(ValidationError("error", "Constraint endpoints are not adjacent in graph", location=a))
+            else:
+                if b not in set(self.get_neighbors(*a)):
+                    v.append(ValidationError("error", "Constraint endpoints are not adjacent (parity)", location=a))
+
+        return v
+
+
+
     def get_statistics(self) -> Dict:
         """
         Get comprehensive grid statistics.

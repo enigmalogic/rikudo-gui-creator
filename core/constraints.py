@@ -778,9 +778,9 @@ class ConstraintEditor:
         """Generate constraint placement recommendations."""
         recommendations = []
         
-        if density > 0.7:
+        if density > 0.5:
             recommendations.append("High constraint density detected - puzzle may be over-constrained")
-        elif density < 0.1:
+        elif density < 0.05:
             recommendations.append("Low constraint density - consider adding more constraints for uniqueness")
         
         error_conflicts = [c for c in conflicts if c.severity == "error"]
