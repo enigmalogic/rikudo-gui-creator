@@ -245,6 +245,9 @@ class ImportPuzzleCommand(Command):
             grid.cell_states = new_grid.cell_states.copy()
             grid.dot_constraints = new_grid.dot_constraints.copy()
             grid.center_location = new_grid.center_location
+
+            # Preserve loaded adjacency (Phase-1 fidelity)
+            grid.loaded_adjacency = getattr(new_grid, 'loaded_adjacency', None)
             
             return True
         except Exception:
@@ -264,6 +267,9 @@ class ImportPuzzleCommand(Command):
             grid.cell_states = old_grid.cell_states.copy()
             grid.dot_constraints = old_grid.dot_constraints.copy()
             grid.center_location = old_grid.center_location
+
+            # Restore loaded adjacency on undo
+            grid.loaded_adjacency = getattr(old_grid, 'loaded_adjacency', None)
             
             return True
         except Exception:

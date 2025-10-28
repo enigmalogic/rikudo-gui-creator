@@ -4,11 +4,14 @@ HexGrid - Clean grid state manager for Rikudo puzzle creator.
 This module provides the core grid representation using EVEN-R coordinate system.
 Integrates with command pattern for undo/redo functionality.
 
-Architecture:
-    - State management only (no validation, no export here)
-    - Delegates neighbor calculation to canonical EVEN-R helper
-    - All mutations through command system
-    - All attributes initialized in __init__ (no hasattr checks needed)
+Phase 1 changes:
+- Schema extension: support layout.non_playable_cells (blocked cosmetics) while keeping layout.center_rc.
+- Loader split: if JSON adjacency is present, store and prefer it as the ground-truth graph ("loaded graph");
+  otherwise fall back to computed EVEN‑R neighbors.
+- Exporter fidelity: when a loaded graph exists, export that exact topology (filtered to playable vertices);
+  otherwise export canonical EVEN‑R topology. Ensure center_rc is also listed in non_playable_cells.
+
+NOTE: No GUI changes here; this is a pure core change.
 """
 from typing import Dict, Tuple, Optional, Set, List
 from utils.evenr import coordinate_to_string, string_to_coordinate
@@ -36,7 +39,7 @@ class HexGrid:
     Responsibilities:
         - Store cell states (empty, prefilled, blocked, holes, center)
         - Store dot constraints between cells
-        - Provide neighbor calculations (delegates to canonical helper)
+        - Provide neighbor calculations (delegates to canonical helper or uses loaded graph)
         - Integrate with command system for undo/redo
     
     Attributes:
@@ -46,6 +49,8 @@ class HexGrid:
         dot_constraints: Set of constraint pairs (normalized)
         center_location: Optional center cell coordinate
         command_history: Undo/redo command stack
+
+        loaded_adjacency: Optional[(row,col) -> set[(row,col)]]  # present only when JSON provided adjacency
     """
     
     def __init__(self, rows: int, cols: int):
@@ -74,6 +79,9 @@ class HexGrid:
         
         # Command history for undo/redo
         self.command_history: CommandHistory = CommandHistory(max_history=100)
+
+        # Optional loaded graph (adjacency) from JSON import
+        self.loaded_adjacency: Optional[Dict[Tuple[int, int], Set[Tuple[int, int]]]] = None
         
         # Initialize all cells as EMPTY
         self._initialize_empty_grid()
@@ -173,39 +181,38 @@ class HexGrid:
         return False
     
     # =============================================================================
-    # NEIGHBOR CALCULATION (EVEN-R)
+    # NEIGHBOR CALCULATION (EVEN-R or LOADED GRAPH)
     # =============================================================================
     
+    def _row_lengths_rect(self) -> List[int]:
+        """Helper: row lengths for rectangular grid (ragged support is Phase 6)."""
+        return [self.cols] * self.rows
+
+    def has_loaded_graph(self) -> bool:
+        """True if this grid was constructed/loaded with an explicit adjacency."""
+        return self.loaded_adjacency is not None
+
     def get_neighbors(self, row: int, col: int) -> List[Tuple[int, int]]:
         """
-        Get all valid neighbors using canonical EVEN-R helper.
-        
-        This delegates to utils.hex_parity.get_hex_neighbors_evenr() to ensure
-        consistency between GUI, export, and all adjacency calculations.
-        
-        Args:
-            row: Row coordinate
-            col: Column coordinate
-        
-        Returns:
-            List of neighboring (row, col) coordinates that exist
+        Get all valid neighbors.
+        If a JSON adjacency was loaded, that is authoritative.
+        Otherwise, delegate to canonical EVEN-R helper.
         """
         if not self.cell_exists(row, col):
             return []
         
-        # Build row_lengths for rectangular grid
-        # TODO: For ragged grids, compute actual row lengths
-        row_lengths = [self.cols] * self.rows
-        
+        # Prefer loaded graph
+        if self.loaded_adjacency is not None:
+            return list(self.loaded_adjacency.get((row, col), set()))
+
+        # Fallback: compute from parity
+        row_lengths = self._row_lengths_rect()
         # Get neighbors from canonical EVEN-R helper
         candidates = get_hex_neighbors_evenr(row_lengths, row, col)
-        
-        # Filter to only existing cells (not holes)
         neighbors = []
         for nr, nc in candidates:
             if self.cell_exists(nr, nc):
                 neighbors.append((nr, nc))
-        
         return neighbors
     
     # =============================================================================
@@ -321,7 +328,7 @@ class HexGrid:
         if not (self.cell_exists(r1, c1) and self.cell_exists(r2, c2)):
             return False
         
-        # Check cells are adjacent
+        # Check cells are adjacent (uses loaded graph if present)
         if cell2 not in self.get_neighbors(r1, c1):
             return False
         
@@ -535,7 +542,7 @@ class HexGrid:
                         location=(row, col)
                     ))
         
-        # Check constraint validity
+        # Check constraint validity (uses active neighbor semantics)
         for (cell1, cell2) in self.dot_constraints:
             if not self.cell_exists(*cell1) or not self.cell_exists(*cell2):
                 errors.append(ValidationError(
@@ -614,17 +621,20 @@ class HexGrid:
         """
         Create a HexGrid from JSON puzzle data.
         
-        Args:
-            json_data: Puzzle data in JSON format
-        
-        Returns:
-            New HexGrid instance
+        Loader split:
+        - Initialize cells as HOLE
+        - Mark NONPLAYABLE cells from layout.non_playable_cells (if present)
+        - Mark vertices from "vertices" (EMPTY/PREFILLED)
+        - Apply center_rc as CENTER
+        - If "adjacency" exists, store it in loaded_adjacency (authoritative)
+        - Add constraints AFTER loaded_adjacency so adjacency checks use the JSON graph
         """
         layout = json_data.get("layout", {})
         rows = layout.get("rows", 7)
         cols = layout.get("cols", 7)
         coordinates = layout.get("coordinates", {})
         center_rc = layout.get("center_rc")
+        non_playable_list = layout.get("non_playable_cells", []) or []
         
         grid = cls(rows, cols)
         
@@ -632,6 +642,18 @@ class HexGrid:
         for row in range(rows):
             for col in range(cols):
                 grid.cell_states[(row, col)] = (CellState.HOLE, None)
+        
+        # Apply non-playable cosmetics (blocked tiles that aren't vertices)
+        for coord in non_playable_list:
+            try:
+                if isinstance(coord, str):
+                    r, c = string_to_coordinate(coord)
+                else:
+                    r, c = int(coord[0]), int(coord[1])
+            except Exception:
+                continue
+            if 0 <= r < rows and 0 <= c < cols:
+                grid.cell_states[(r, c)] = (CellState.NONPLAYABLE, None)
         
         # Set vertices from JSON
         vertices = json_data.get("vertices", {})
@@ -642,7 +664,7 @@ class HexGrid:
             else:
                 try:
                     row, col = string_to_coordinate(vertex_id)
-                except:
+                except Exception:
                     continue
             
             if not (0 <= row < rows and 0 <= col < cols):
@@ -655,13 +677,45 @@ class HexGrid:
             else:
                 grid.cell_states[(row, col)] = (CellState.EMPTY, None)
         
-        # Set center cell if specified
+        # Set center cell if specified (center is non-playable by definition)
         if center_rc and isinstance(center_rc, list) and len(center_rc) == 2:
             center_row, center_col = int(center_rc[0]), int(center_rc[1])
             if 0 <= center_row < rows and 0 <= center_col < cols:
                 grid.set_cell_state(center_row, center_col, CellState.CENTER)
         
-        # Add constraints
+        # Build loaded adjacency if provided
+        loaded_adj_raw: Dict[str, List[str]] = json_data.get("adjacency", {})
+        if loaded_adj_raw:
+            loaded_map: Dict[Tuple[int, int], Set[Tuple[int, int]]] = {}
+            # Prepare playable set for safety (adjacency usually lists only vertices)
+            playable_set = set(grid.get_playable_cells().keys())
+            for vid, neigh_ids in loaded_adj_raw.items():
+                try:
+                    if vid in coordinates:
+                        r, c = coordinates[vid]
+                    else:
+                        r, c = string_to_coordinate(vid)
+                except Exception:
+                    continue
+                key = (int(r), int(c))
+                if key not in loaded_map:
+                    loaded_map[key] = set()
+                for nid in neigh_ids:
+                    try:
+                        if nid in coordinates:
+                            nr, nc = coordinates[nid]
+                        else:
+                            nr, nc = string_to_coordinate(nid)
+                        nbr = (int(nr), int(nc))
+                        # Keep only neighbors that exist in grid bounds;
+                        # do not force-playable here; constraint checks will enforce playability
+                        if 0 <= nr < rows and 0 <= nc < cols:
+                            loaded_map[key].add(nbr)
+                    except Exception:
+                        continue
+            grid.loaded_adjacency = loaded_map
+        
+        # Add constraints (now get_neighbors will honor loaded_adjacency if present)
         constraints = json_data.get("constraints", {})
         dots = constraints.get("dots", [])
         for dot_pair in dots:
@@ -676,8 +730,8 @@ class HexGrid:
                         r1, c1 = string_to_coordinate(v1_id)
                         r2, c2 = string_to_coordinate(v2_id)
                     
-                    grid.add_dot_constraint((r1, c1), (r2, c2))
-                except:
+                    grid.add_dot_constraint((int(r1), int(c1)), (int(r2), int(c2)))
+                except Exception:
                     # Skip malformed constraints
                     continue
         
@@ -686,15 +740,58 @@ class HexGrid:
         
         return grid
     
+    def _build_adjacency_for_export(self) -> Dict[str, List[str]]:
+        """
+        Build adjacency for export based on current mode:
+        - If a loaded graph exists: export that topology verbatim (filtered to playable set)
+        - Else: export canonical EVEN-R adjacency among playable cells
+        """
+        playable = set(self.get_playable_cells().keys())
+        adjacency: Dict[str, List[str]] = {}
+        if self.loaded_adjacency is not None:
+            for (r, c) in playable:
+                vid = coordinate_to_string(r, c)
+                nbrs = []
+                for (nr, nc) in self.loaded_adjacency.get((r, c), set()):
+                    if (nr, nc) in playable:
+                        nbrs.append(coordinate_to_string(nr, nc))
+                adjacency[vid] = sorted(nbrs)
+            return adjacency
+        
+        # Fallback: compute from parity
+        for (row, col) in playable:
+            vertex_id = coordinate_to_string(row, col)
+            neighbors = self.get_neighbors(row, col)  # will compute parity in this branch
+            playable_neighbors = []
+            for (nr, nc) in neighbors:
+                if (nr, nc) in playable:
+                    playable_neighbors.append(coordinate_to_string(nr, nc))
+            adjacency[vertex_id] = sorted(playable_neighbors)
+        return adjacency
+
+    def _collect_non_playable_for_export(self) -> List[str]:
+        """
+        Build layout.non_playable_cells list.
+        Includes all NONPLAYABLE cells and the center cell (if present).
+        HOLE cells are *not* listed; they are rendered as empty space.
+        """
+        non_playable: Set[Tuple[int, int]] = set()
+        for (row, col), (state, _) in self.cell_states.items():
+            if state == CellState.NONPLAYABLE:
+                non_playable.add((row, col))
+        # Center SHOULD be listed as non-playable cosmetic too
+        if self.center_location is not None:
+            non_playable.add(self.center_location)
+        return [coordinate_to_string(r, c) for (r, c) in sorted(non_playable)]
+    
     def to_json(self, puzzle_id: str = "created_puzzle") -> Dict:
         """
-        Export grid to JSON format using canonical EVEN-R neighbors.
+        Export grid to JSON format with Phase 1 rules.
         
-        Args:
-            puzzle_id: Identifier for the puzzle
-        
-        Returns:
-            Dict in JSON puzzle format
+        - vertices/coordinates from current playable cells
+        - adjacency: loaded graph if present, else canonical EVEN-R
+        - layout: rows/cols/coordinates + center_rc (if any) + non_playable_cells (center included)
+        - constraints: include only those whose endpoints are adjacent in the exported adjacency
         """
         vertices = {}
         coordinates = {}
@@ -706,26 +803,20 @@ class HexGrid:
             vertices[vertex_id] = {"value": value}
             coordinates[vertex_id] = [row, col]
         
-        # Build adjacency using canonical EVEN-R neighbors
-        adjacency = {}
-        for (row, col) in playable_cells.keys():
-            vertex_id = coordinate_to_string(row, col)
-            neighbors = self.get_neighbors(row, col)
-            
-            playable_neighbors = []
-            for (nr, nc) in neighbors:
-                if (nr, nc) in playable_cells:
-                    playable_neighbors.append(coordinate_to_string(nr, nc))
-            
-            adjacency[vertex_id] = sorted(playable_neighbors)
+        # Build adjacency per rules
+        adjacency = self._build_adjacency_for_export()
         
-        # Export constraints
+        # Export constraints, filtered by adjacency
         dots = []
+        # Build a quick lookup from adjacency
+        adj_lookup: Dict[str, Set[str]] = {k: set(vs) for k, vs in adjacency.items()}
         for (cell1, cell2) in self.dot_constraints:
             if cell1 in playable_cells and cell2 in playable_cells:
                 v1_id = coordinate_to_string(cell1[0], cell1[1])
                 v2_id = coordinate_to_string(cell2[0], cell2[1])
-                dots.append([v1_id, v2_id])
+                # keep only if adjacency contains the edge
+                if v2_id in adj_lookup.get(v1_id, set()):
+                    dots.append([v1_id, v2_id])
         
         # Build layout section
         layout = {
@@ -736,6 +827,9 @@ class HexGrid:
         
         if self.center_location is not None and self.cell_exists(*self.center_location):
             layout["center_rc"] = [self.center_location[0], self.center_location[1]]
+        
+        # NEW: non_playable_cells (center included as cosmetic)
+        layout["non_playable_cells"] = self._collect_non_playable_for_export()
         
         return {
             "id": puzzle_id,
