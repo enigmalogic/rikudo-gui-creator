@@ -304,7 +304,16 @@ class HexCanvas:
             if cell == self.constraint_start_cell:
                 # Clicked same cell, cancel
                 self.constraint_start_cell = None
-            else:
+            else:                # Enforce adjacency at GUI level (use loaded graph when present)
+                nbrs = set(self.grid.get_neighbors(*self.constraint_start_cell))
+                if (row, col) not in nbrs:
+                    messagebox.showwarning(
+                        "Invalid Constraint",
+                        "Select a highlighted neighbor (only adjacent cells can be linked)."
+                    )
+                    # Keep start cell active so the user can try another neighbor
+                    return
+
                 # Try to add/remove constraint using command system
                 if self.grid.has_dot_constraint(self.constraint_start_cell, cell):
                     success = self.grid.cmd_remove_dot_constraint(self.constraint_start_cell, cell)
