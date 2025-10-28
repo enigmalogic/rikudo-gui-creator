@@ -1,0 +1,88 @@
+# ─── 1) GENERAL / IDE / OS FILES ────────────────────────────────────────────
+# macOS
+.DS_Store
+# Windows
+Thumbs.db
+# IDEs/editors
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# ─── 2) PYTHON ARTIFACTS ───────────────────────────────────────────────────
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+eggs/
+pip-wheel-metadata/
+wheelhouse/
+
+# Virtual envs
+env/
+venv/
+.venv/
+ENV/
+env.bak/
+env.old/
+
+# Test / coverage outputs
+.coverage
+htmlcov/
+.pytest_cache/
+nosetests.xml
+coverage.xml
+
+# Logs
+*.log
+
+# ─── 3) C++ / PYBIND11 / CMAKE ──────────────────────────────────────────────
+# Compiled object files
+*.o
+*.obj
+*.lo
+*.la
+
+# Static libraries
+*.a
+*.lib
+
+# Shared libraries / extensions (pybind11 will produce these)
+*.so
+*.pyd    # Windows Python extension
+*.dll
+*.dylib  # macOS
+
+# CMake build artifacts
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+# if you use out-of-source builds, you might have a build/ dir
+build/
+cmake-build-*/
+
+# Ninja
+build.ninja
+*.ninja
+
+# Autotools
+install-sh
+Makefile.in
+aclocal.m4
+autom4te.cache/
+
+# ─── 4) OPTIONAL / EXTRA ────────────────────────────────────────────────────
+# Doc builds
+docs/_build/
+
+# Your own custom ignores
+# e.g. logs/, tmp/, secret_keys.env, etc.
