@@ -593,6 +593,8 @@ class HexCanvas:
                 success = self.grid.cmd_import_puzzle(json_data)
                 
                 if success:
+                    # Clear undo/redo history for new puzzle state
+                    self.grid.clear_history()
                     # Show import summary
                     stats = self.grid.get_statistics()
                     summary = f"""Puzzle imported successfully!
