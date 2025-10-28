@@ -9,6 +9,8 @@ from core.hex_grid import HexGrid
 from core.types import CellState, ValidationError
 from render.hex_render import HexRenderer
 from core.constraints import ConstraintEditor
+from tkinter import messagebox
+import json
 
 class HexCanvas:
     """Enhanced interactive canvas for editing hexagonal Rikudo puzzles with undo/redo."""
@@ -52,6 +54,47 @@ class HexCanvas:
         self.inspect_target: Optional[Tuple[int, int]] = None
         self.inspect_neighbors: Set[Tuple[int, int]] = set()
         self.position_callback: Optional[Callable] = None
+
+    def _count_invalid_constraints_in_file(self, json_data: dict) -> int:
+        """
+        Count how many 'dot' constraints in the JSON file are NOT edges in the file's
+        own adjacency (undirected check on 'r,c' string vertex IDs). This is a pre-import
+        scan so we can report what the loader will ignore.
+        """
+        try:
+            adj = json_data.get("adjacency", {}) or {}
+            cons = (json_data.get("constraints") or {}).get("dots") or []
+            if not isinstance(adj, dict) or not isinstance(cons, list):
+                return 0
+
+            # Build undirected edge set of string pairs ("r,c","r,c")
+            edges = set()
+            for a, nbrs in adj.items():
+                for b in nbrs:
+                    edges.add(tuple(sorted([a, b])))
+
+            def as_pair(x):
+                # x should be ["r,c","u,v"]; return sorted tuple
+                if not (isinstance(x, (list, tuple)) and len(x) == 2):
+                    return None
+                a, b = x
+                if not (isinstance(a, str) and isinstance(b, str)):
+                    return None
+                return tuple(sorted([a, b]))
+
+            invalid = 0
+            for pair in cons:
+                p = as_pair(pair)
+                if p is None:
+                    # malformed item -> count it as invalid input
+                    invalid += 1
+                    continue
+                if p not in edges:
+                    invalid += 1
+            return invalid
+        except Exception:
+            # Never crash the UI because of a malformed file; just report 0
+            return 0
     
     def set_enhanced_mode(self, enabled: bool):
         """Enable/disable enhanced constraint editing."""
@@ -584,51 +627,92 @@ class HexCanvas:
             width=3,
             fill=""
         )
-    
-    def import_puzzle(self):
-        """Import a puzzle from JSON file using command system."""
-        filename = filedialog.askopenfilename(
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            title="Import Puzzle from JSON"
-        )
-        
-        if filename:
-            try:
-                import json
-                with open(filename, 'r') as f:
-                    json_data = json.load(f)
-                
-                # Use command-based import for undo/redo support
-                success = self.grid.cmd_import_puzzle(json_data)
-                
-                if success:
-                    # Clear undo/redo history for new puzzle state
-                    self.grid.clear_history()
-                    # Show import summary
-                    stats = self.grid.get_statistics()
-                    summary = f"""Puzzle imported successfully!
-                    
-Grid: {self.grid.rows} × {self.grid.cols}
-Playable cells: {stats['total_playable']}
-Prefilled cells: {stats['prefilled_cells']}
-Constraints: {stats['dot_constraints']}
-Holes: {stats['hole_cells']}
 
-Validation: {stats['errors']} errors, {stats['warnings']} warnings"""
-                    
-                    messagebox.showinfo("Import Success", summary)
-                    
-                    self._notify_grid_change()
-                    self.redraw_grid()
-                else:
-                    messagebox.showerror("Import Error", "Failed to import puzzle. Please check the file format.")
-                    
-            except FileNotFoundError:
-                messagebox.showerror("Import Error", "File not found.")
-            except json.JSONDecodeError as e:
-                messagebox.showerror("Import Error", f"Invalid JSON format: {str(e)}")
-            except Exception as e:
-                messagebox.showerror("Import Error", f"Failed to import puzzle: {str(e)}")
+    def import_puzzle(self) -> None:
+        """
+        Import a JSON puzzle:
+        1) Let user pick a file
+        2) Pre-scan: count invalid constraints present in the file (will be ignored on load)
+        3) Import via the command (model discards invalid dots)
+        4) Clear history (new base state)
+        5) Optionally run auto-clean (should be 0 typically, since loader already ignored)
+        6) Show summary including 'invalid in file (ignored on load)'
+        """
+        path = filedialog.askopenfilename(
+            title="Import Puzzle JSON",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                json_data = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Import Error", f"Failed to read JSON: {e}")
+            return
+
+        # --- Phase-3 Option A: pre-scan invalid constraints from the FILE itself
+        invalid_in_file = self._count_invalid_constraints_in_file(json_data)
+
+        # Import into the model (the loader will ignore invalid constraints)
+        try:
+            success = self.grid.cmd_import_puzzle(json_data)
+        except Exception as e:
+            messagebox.showerror("Import Error", f"Failed to import puzzle: {e}")
+            return
+
+        if success:
+            # New universe: clear undo/redo so this is the clean base
+            if hasattr(self.grid, "clear_history"):
+                self.grid.clear_history()
+
+            # Summary
+            try:
+                stats = self.grid.get_statistics()
+            except Exception:
+                stats = {
+                    "total_playable": "?",
+                    "prefilled_cells": "?",
+                    "dot_constraints": "?",
+                    "hole_cells": "?",
+                    "errors": "?",
+                    "warnings": "?"
+                }
+
+            # Build base summary (always shown)
+            summary = (
+                "Puzzle imported successfully!\n\n"
+                f"Grid: {self.grid.rows} × {self.grid.cols}\n"
+                f"Playable cells: {stats['total_playable']}\n"
+                f"Prefilled cells: {stats['prefilled_cells']}\n"
+                f"Constraints: {stats['dot_constraints']}\n"
+                f"Holes: {stats['hole_cells']}\n\n"
+                f"Validation: {stats['errors']} errors, {stats['warnings']} warnings"
+            )
+
+            # If user loaded a corrupt file → show a **separate** warning dialog
+            if invalid_in_file > 0:
+                messagebox.showwarning(
+                    "Corrupted JSON Detected!",
+                    (
+                        f"The JSON file contained {invalid_in_file} invalid constraint(s).\n\n"
+                        "They were ignored on load because they refer to cells that are not "
+                        "adjacent according to the puzzle's adjacency graph.\n\n"
+                        "The puzzle may be incomplete or rendered incorrectly.\n\n"
+                        "If this puzzle came from another tool or an older exporter,\n"
+                        "you should fix constraints and export a clean JSON."
+                    )
+                )
+
+            # Now show success summary
+            messagebox.showinfo("Import Success", summary)
+
+
+            # Redraw canvas to reflect the imported state
+            self.redraw_grid()
+        else:
+            messagebox.showwarning("Import", "Import did not succeed.")
     
     def export_json(self):
         """Export the current grid as JSON."""
