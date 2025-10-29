@@ -183,21 +183,96 @@ class ConstraintEditor:
 
     def _askinteger_topmost(self, title, prompt, **kwargs):
         """
-        Ask for an integer with a dialog that reliably stays on top.
-        Temporarily sets the parent to -topmost during the prompt and restores it after.
+        Integer prompt that:
+          - stays on top,
+          - focuses the entry and selects all text,
+          - submits on Enter, cancels on Esc,
+          - enforces minvalue/maxvalue if provided.
+        Drop-in replacement for simpledialog.askinteger.
         """
         parent = self._dialog_parent()
-        if parent is not None:
+        minv = kwargs.get("minvalue", None)
+        maxv = kwargs.get("maxvalue", None)
+        initial = kwargs.get("initialvalue", 1)
+
+        # If no parent available, fallback to simpledialog
+        if parent is None:
+            return simpledialog.askinteger(title, prompt, **kwargs)
+
+        result = {"value": None}
+
+        top = tk.Toplevel(parent)
+        top.title(title)
+        top.transient(parent)
+        try:
+            parent.lift()
+            parent.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        # --- Layout ---
+        frm = tk.Frame(top, padx=12, pady=10)
+        frm.pack(fill="both", expand=True)
+
+        lbl = tk.Label(frm, text=prompt, anchor="w", justify="left")
+        lbl.pack(fill="x", pady=(0, 6))
+
+        sv = tk.StringVar(value=str(initial if initial is not None else ""))
+        entry = tk.Entry(frm, textvariable=sv)
+        entry.pack(fill="x")
+
+        btn_row = tk.Frame(frm)
+        btn_row.pack(fill="x", pady=(10, 0))
+
+        def _ok():
+            s = sv.get().strip()
             try:
-                parent.lift(); parent.attributes('-topmost', True); parent.update_idletasks()
-                return simpledialog.askinteger(title, prompt, parent=parent, **kwargs)
-            finally:
-                try:
-                    parent.attributes('-topmost', False)
-                except Exception:
-                    pass
-        # Fallback without explicit parent
-        return simpledialog.askinteger(title, prompt, **kwargs)
+                val = int(s)
+                if (minv is not None and val < minv) or (maxv is not None and val > maxv):
+                    top.bell()
+                    entry.focus_set()
+                    entry.selection_range(0, tk.END)
+                    return
+                result["value"] = val
+                top.destroy()
+            except ValueError:
+                top.bell()
+                entry.focus_set()
+                entry.selection_range(0, tk.END)
+
+        def _cancel():
+            result["value"] = None
+            top.destroy()
+
+        ok_btn = tk.Button(btn_row, text="OK", width=8, command=_ok, default="active")
+        cancel_btn = tk.Button(btn_row, text="Cancel", width=8, command=_cancel)
+        ok_btn.pack(side="right", padx=(6, 0))
+        cancel_btn.pack(side="right")
+
+        # Keys: Enter=OK, Esc=Cancel (also keypad Enter)
+        top.bind("<Return>", lambda e: _ok())
+        top.bind("<KP_Enter>", lambda e: _ok())
+        top.bind("<Escape>", lambda e: _cancel())
+
+        # Focus, select-all, modal grab
+        top.update_idletasks()
+        top.grab_set()
+        try:
+            top.attributes("-topmost", True)
+        except Exception:
+            pass
+        entry.focus_set()
+        entry.selection_range(0, tk.END)
+
+        parent.wait_window(top)
+
+        # Restore parent's topmost
+        try:
+            parent.attributes("-topmost", False)
+        except Exception:
+            pass
+
+        return result["value"]
 
     def _askyesnocancel_topmost(self, title, prompt):
         """askyesnocancel that stays on top and is parented to the main window."""
