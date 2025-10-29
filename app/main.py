@@ -538,6 +538,14 @@ WORKFLOW:
         if self.canvas.constraint_editor.selection_mode:
             # Exit batch selection mode
             self.canvas.constraint_editor.exit_selection_mode()
+
+            # If Batch Operations window is open, close it
+            dlg = getattr(self, "_batch_ops_dialog", None)
+            if dlg and dlg.winfo_exists():
+                try:
+                    dlg.destroy()
+                finally:
+                    self._batch_ops_dialog = None
             
             # Re-enable edit mode controls
             self._set_edit_mode_enabled(True)
@@ -592,6 +600,12 @@ WORKFLOW:
         dialog.geometry("350x600")
         dialog.transient(self.root)
         dialog.grab_set()
+        # Track the window so we can auto-close it when batch mode ends
+        self._batch_ops_dialog = dialog
+        dialog.protocol(
+            "WM_DELETE_WINDOW",
+            lambda d=dialog: (setattr(self, "_batch_ops_dialog", None), d.destroy())
+        )
         
         # Title
         title_label = ttk.Label(dialog, text=f"Batch Operations", font=("Arial", 14, "bold"))
