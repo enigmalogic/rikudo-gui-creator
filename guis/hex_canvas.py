@@ -9,8 +9,10 @@ from core.hex_grid import HexGrid
 from core.types import CellState, ValidationError
 from render.hex_render import HexRenderer
 from core.constraints import ConstraintEditor
-from tkinter import messagebox
 import json
+import math
+import tkinter.ttk as ttk
+
 
 class HexCanvas:
     """Enhanced interactive canvas for editing hexagonal Rikudo puzzles with undo/redo."""
@@ -55,6 +57,18 @@ class HexCanvas:
         self.inspect_neighbors: Set[Tuple[int, int]] = set()
         self.position_callback: Optional[Callable] = None
 
+        # Start/End (1 and max) highlight items
+        self._endpoint_highlight_items = []
+
+        # --- Endpoint hex style (tweak here) ---
+        # Scale relative to a cell's hex_size (e.g., 0.80 = 80% of cell radius)
+        self.endpoint_hex_scale_start = 0.82
+        self.endpoint_hex_scale_end   = 0.82
+        # Outline width
+        self.endpoint_hex_width       = 2
+        # Colors (start=1, end=max)
+        self.endpoint_color_start     = "#000000"  # green
+        self.endpoint_color_end       = "#000000"  # red
     def _count_invalid_constraints_in_file(self, json_data: dict) -> int:
         """
         Count how many 'dot' constraints in the JSON file are NOT edges in the file's
@@ -488,6 +502,9 @@ class HexCanvas:
             self.constraint_editor._update_visual_guides()
 
         self._draw_inspect_overlay()
+
+        # Draw start/end highlight rings on top of everything else
+        self._draw_endpoint_highlights()
     
     def _draw_cell(self, row: int, col: int):
         """Draw a single cell with appropriate styling."""
@@ -627,6 +644,81 @@ class HexCanvas:
             width=3,
             fill=""
         )
+
+    # ------------------------------------------------------------------
+    # Endpoint (min=1 / max=max_value) highlight helpers
+    # ------------------------------------------------------------------
+    def _clear_endpoint_highlights(self):
+        """Remove existing start/end highlight rings."""
+        try:
+            self.canvas.delete("endpoint_highlight")
+        except Exception:
+            pass
+        self._endpoint_highlight_items.clear()
+
+    def _hex_points(self, cx: float, cy: float, size: float):
+        """Return the 6 (x, y) points of a pointy-top hex centered at (cx, cy)."""
+        pts = []
+        # Pointy-top hex: angles 30°, 90°, 150°, 210°, 270°, 330°
+        for k in range(6):
+            ang = math.radians(30 + 60 * k)
+            pts.append((cx + size * math.cos(ang), cy + size * math.sin(ang)))
+        # flatten to [x1,y1,x2,y2,...]
+        flat = []
+        for x, y in pts:
+            flat.extend((x, y))
+        return flat
+
+    def _draw_endpoint_highlights(self):
+        """Draw a single smaller hexagon on cells with value==1 and value==max_value."""
+        if self.grid is None or self.renderer is None:
+            return
+
+        # Collect start/end cells among PREFILLED numbers
+        start_cells = []
+        end_cells = []
+        try:
+            max_val = self.grid.get_max_possible_value()
+        except Exception:
+            max_val = 0
+
+        for (r, c), (state, value) in self.grid.cell_states.items():
+            if state == CellState.PREFILLED and isinstance(value, int):
+                if value == 1:
+                    start_cells.append((r, c))
+                if max_val and value == max_val:
+                    end_cells.append((r, c))
+
+        if not start_cells and not end_cells:
+            self._clear_endpoint_highlights()
+            return
+
+        # Clear previous and render new rings
+        self._clear_endpoint_highlights()
+        
+        
+        start_color = self.endpoint_color_start
+        end_color   = self.endpoint_color_end
+        base        = self.renderer.hex_size
+
+        for (bucket, color, scale) in (
+            (start_cells, start_color, self.endpoint_hex_scale_start),
+            (end_cells,  end_color,   self.endpoint_hex_scale_end),
+        ):
+            for (r, c) in bucket:
+                cx, cy = self.renderer.evenr_to_pixel(
+                    r, c, self.canvas_offset_x, self.canvas_offset_y
+                )
+                
+                size = max(2.0, base * float(scale))
+                pts  = self._hex_points(cx, cy, size)
+                iid  = self.canvas.create_polygon(
+                    *pts, outline=color, width=2, fill="",
+                     joinstyle=tk.ROUND, smooth=False, tags=("endpoint_highlight",)
+                )
+                
+                self._endpoint_highlight_items.append(iid)
+
 
     def import_puzzle(self) -> None:
         """

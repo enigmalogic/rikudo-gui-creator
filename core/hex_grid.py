@@ -216,6 +216,25 @@ class HexGrid:
         return neighbors
     
     # =============================================================================
+    # Graph sanitization helpers
+    # =============================================================================
+    def _sanitize_center_in_loaded_graph(self) -> None:
+        """
+        Ensure the center cell is NOT present in the loaded JSON graph.
+        Removes the center as a key and from all neighbor sets.
+        No-ops if there is no loaded graph or no center set.
+        """
+        if self.loaded_adjacency is None or self.center_location is None:
+            return
+        cr, cc = self.center_location
+        # Drop center as a vertex
+        self.loaded_adjacency.pop((cr, cc), None)
+        # Drop center from neighbor lists
+        for k, nbrs in list(self.loaded_adjacency.items()):
+            if (cr, cc) in nbrs:
+                nbrs.discard((cr, cc))
+    
+    # =============================================================================
     # DIRECT CELL STATE MUTATIONS (used by commands)
     # =============================================================================
     
@@ -240,6 +259,9 @@ class HexGrid:
                 self.cell_states[(old_row, old_col)] = (CellState.EMPTY, None)
             self.center_location = (row, col)
             value = None  # Center cells don't have values
+            # If we are using a loaded JSON graph, ensure the center is not a vertex
+            if self.loaded_adjacency is not None:
+                self._sanitize_center_in_loaded_graph()
         elif self.center_location == (row, col) and state != CellState.CENTER:
             # This cell was center, now it's not
             self.center_location = None
@@ -883,6 +905,10 @@ class HexGrid:
                     except Exception:
                         continue
             grid.loaded_adjacency = loaded_map
+
+            # Final import-time safety: if both center and loaded graph exist, strip center from graph
+        if grid.center_location is not None and grid.loaded_adjacency is not None:
+            grid._sanitize_center_in_loaded_graph()
         
         # Add constraints (now get_neighbors will honor loaded_adjacency if present)
         constraints = json_data.get("constraints", {})
@@ -985,7 +1011,9 @@ class HexGrid:
                 v2_id = coordinate_to_string(cell2[0], cell2[1])
                 # keep only if adjacency contains the edge
                 if v2_id in adj_lookup.get(v1_id, set()):
-                    dots.append([v1_id, v2_id])
+                    # canonicalize each pair and collect
+                    a, b = sorted([v1_id, v2_id])
+                    dots.append([a, b])
         
         # Build layout section
         layout = {
@@ -999,15 +1027,27 @@ class HexGrid:
         
         # NEW: non_playable_cells (center included as cosmetic)
         layout["non_playable_cells"] = self._collect_non_playable_for_export()
-        
+
+        # --- Deterministic ordering for diff-friendly JSON ---
+        # 1) sort vertex/coordinate maps by vertex_id
+        vertices_sorted = {vid: vertices[vid] for vid in sorted(vertices)}
+        coordinates_sorted = {vid: coordinates[vid] for vid in sorted(coordinates)}
+        # 2) sort adjacency keys; neighbor lists already sorted in _build_adjacency_for_export()
+        adjacency_sorted = {vid: adjacency[vid] for vid in sorted(adjacency)}
+        # 3) sort constraint pairs lexicographically
+        dots_sorted = sorted(dots, key=lambda p: (p[0], p[1]))
+
         return {
             "id": puzzle_id,
             "max_value": self.get_max_possible_value(),
-            "vertices": vertices,
-            "adjacency": adjacency,
-            "constraints": {"dots": dots},
-            "layout": layout
+            "vertices": vertices_sorted,
+            "adjacency": adjacency_sorted,
+            "constraints": {"dots": dots_sorted},
+            "layout": {
+                **layout,
+                "coordinates": coordinates_sorted
         }
+    }
     
     @classmethod
     def load_from_file(cls, filename: str) -> 'HexGrid':
@@ -1019,4 +1059,5 @@ class HexGrid:
     def save_json(self, filename: str, puzzle_id: str = "created_puzzle") -> None:
         """Save grid to JSON file."""
         with open(filename, 'w') as f:
-            json.dump(self.to_json(puzzle_id), f, indent=2)
+            # Write with sorted keys for deterministic, diff-friendly output
+            json.dump(self.to_json(puzzle_id), f, indent=2, sort_keys=True)

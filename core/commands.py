@@ -221,6 +221,67 @@ class BatchCommand(Command):
     def get_description(self) -> str:
         """Get description of the batch operation."""
         return self.description
+    
+class LiveBatchCommand(Command):
+    """
+    A batch that executes each child command immediately (so the board updates
+    after every input), but is committed to history as a *single* undo/redo step.
+    First call to execute() (when added to history) is a no-op commit;
+    on redo, execute() replays all child commands.
+    """
+    def __init__(self, description: str):
+        self.description = description
+        self.commands: List[Command] = []
+        self.executed_commands: List[Command] = []
+        self._committed = False  # set True once added to history
+
+    def add_and_execute(self, grid, command: Command) -> bool:
+        """Execute now (updates board immediately) and stage for single-step undo."""
+        if command.execute(grid):
+            self.commands.append(command)
+            self.executed_commands.append(command)
+            return True
+        # If a command fails, roll back any executed so far in this live batch
+        for done in reversed(self.executed_commands):
+            done.undo(grid)
+        self.commands.clear()
+        self.executed_commands.clear()
+        return False
+
+    def execute(self, grid) -> bool:
+        """
+        Commit to history. If not yet committed, do *not* re-execute (already applied).
+        On redo (after an undo), replay all commands.
+        """
+        if not self._committed:
+            # First time added to history: mark committed; commands already applied.
+            self._committed = True
+            return True
+
+        # Redo path: re-apply all commands
+        self.executed_commands.clear()
+        for cmd in self.commands:
+            if cmd.execute(grid):
+                self.executed_commands.append(cmd)
+            else:
+                # rollback redo if any child fails
+                for done in reversed(self.executed_commands):
+                    done.undo(grid)
+                self.executed_commands.clear()
+                return False
+        return True
+
+    def undo(self, grid) -> bool:
+        """Undo all already-executed commands (reverse order)."""
+        ok = True
+        for cmd in reversed(self.executed_commands):
+            if not cmd.undo(grid):
+                ok = False
+        self.executed_commands.clear()
+        return ok
+
+    def get_description(self) -> str:
+        return self.description
 
 class ImportPuzzleCommand(Command):
     """Command to import a complete puzzle (batch operation)."""

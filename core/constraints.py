@@ -14,7 +14,7 @@ from core.commands import Command, BatchCommand, AddDotConstraintCommand, Remove
 
 from core.commands import (
     Command, BatchCommand, SetCellStateCommand, SetCellValueCommand,
-    AddDotConstraintCommand, RemoveDotConstraintCommand
+    AddDotConstraintCommand, RemoveDotConstraintCommand, LiveBatchCommand
 )
 
 class ConstraintType(Enum):
@@ -169,6 +169,49 @@ class ConstraintEditor:
         
         # Batch operation state
         self.batch_operations: List[Command] = []
+
+        # Current-numbering highlight
+        self.current_prompt_items: List[int] = []
+
+    # ---------- dialog helpers to keep prompts always on top ----------
+    def _dialog_parent(self):
+        """Return the toplevel window to parent dialogs; None if unavailable."""
+        try:
+            return self.canvas.canvas.winfo_toplevel()
+        except Exception:
+            return None
+
+    def _askinteger_topmost(self, title, prompt, **kwargs):
+        """
+        Ask for an integer with a dialog that reliably stays on top.
+        Temporarily sets the parent to -topmost during the prompt and restores it after.
+        """
+        parent = self._dialog_parent()
+        if parent is not None:
+            try:
+                parent.lift(); parent.attributes('-topmost', True); parent.update_idletasks()
+                return simpledialog.askinteger(title, prompt, parent=parent, **kwargs)
+            finally:
+                try:
+                    parent.attributes('-topmost', False)
+                except Exception:
+                    pass
+        # Fallback without explicit parent
+        return simpledialog.askinteger(title, prompt, **kwargs)
+
+    def _askyesnocancel_topmost(self, title, prompt):
+        """askyesnocancel that stays on top and is parented to the main window."""
+        parent = self._dialog_parent()
+        if parent is not None:
+            try:
+                parent.lift(); parent.attributes('-topmost', True); parent.update_idletasks()
+                return messagebox.askyesnocancel(title, prompt, parent=parent)
+            finally:
+                try:
+                    parent.attributes('-topmost', False)
+                except Exception:
+                    pass
+        return messagebox.askyesnocancel(title, prompt)
     
     def enter_selection_mode(self):
         """Enter batch selection mode for constraint operations."""
@@ -183,6 +226,30 @@ class ConstraintEditor:
         self.selected_cells.clear()
         self.selection_order.clear()  # Clear order tracking
         self._clear_visual_guides()
+        self._clear_current_number_highlight()
+
+    # ---------- visual helpers for current cell being edited ----------
+    def _show_current_number_highlight(self, row: int, col: int, color: str = "#00BFFF"):
+        self._clear_current_number_highlight()
+        if not getattr(self.canvas, "renderer", None):
+            return
+        x, y = self.canvas.renderer.evenr_to_pixel(
+            row, col, self.canvas.canvas_offset_x, self.canvas.canvas_offset_y
+        )
+        radius = self.canvas.renderer.hex_size + 4
+        item_id = self.canvas.canvas.create_oval(
+            x - radius, y - radius, x + radius, y + radius,
+            outline=color, width=3, fill="", tags="current_number_target"
+        )
+        self.current_prompt_items.append(item_id)
+
+    def _clear_current_number_highlight(self):
+        for iid in self.current_prompt_items:
+            try:
+                self.canvas.canvas.delete(iid)
+            except Exception:
+                pass
+        self.current_prompt_items.clear()
     
     def toggle_cell_selection(self, row: int, col: int) -> bool:
         """Toggle cell selection in batch mode."""
@@ -457,42 +524,196 @@ class ConstraintEditor:
 
     def _batch_number_custom_start(self):
         """Number cells starting from a custom number."""
+        """Number cells by selection order, starting from a custom number.
+        Live applies each value (instant board update) and commits as a single undo step."""
         if not self.selection_mode or not self.selected_cells:
             return False
-        
-        # Ask for starting number
-        start_num = simpledialog.askinteger("Custom Numbering", 
-                                        "Enter starting number:", 
-                                        minvalue=1, maxvalue=999, initialvalue=1)
-        if start_num is None:
-            return False
-        
-        # Use selection order for custom numbering
+
+        # Resolve playable cells in explicit selection order
         playable_cells = []
         for cell in self.selection_order:
             if cell in self.selected_cells:
-                row, col = cell
-                state, _ = self.grid.get_cell_state(row, col)
+                r, c = cell
+                state, _ = self.grid.get_cell_state(r, c)
                 if state in (CellState.EMPTY, CellState.PREFILLED):
-                    playable_cells.append(cell)
-        
+                    playable_cells.append((r, c))
+
         if not playable_cells:
-            messagebox.showwarning("No Playable Cells", "No playable cells in selection.")
+            messagebox.showwarning("No Playable Cells", "No playable cells in selection.", parent=self._dialog_parent())
             return False
-        
-        commands = []
+
+        max_val = getattr(self.grid, "get_max_possible_value", lambda: 999)()
+        start_num = self._askinteger_topmost(
+            "Custom Numbering",
+            "Enter starting number:",
+            minvalue=1, maxvalue=max_val, initialvalue=1
+        )
+        if start_num is None:
+            return False
+
+        # Prefer live updates with single undo step
+        try:
+            from core.commands import LiveBatchCommand
+        except Exception:
+            LiveBatchCommand = None
+
+        if LiveBatchCommand is None:
+            commands = [SetCellValueCommand(r, c, start_num + i)
+                        for i, (r, c) in enumerate(playable_cells)]
+            batch_command = BatchCommand(commands, f"Number {len(commands)} cells starting from {start_num}")
+            success = self.grid.command_history.execute_command(batch_command, self.grid)
+            if success:
+                self.canvas.redraw_grid()
+                end_num = start_num + len(commands) - 1
+                messagebox.showinfo(
+                    "Custom Numbering",
+                    f"Numbered {len(commands)} cells from {start_num} to {end_num}",
+                    parent=self._dialog_parent()
+                )
+            return success
+
+        live = LiveBatchCommand(f"Number {len(playable_cells)} cells from {start_num}")
         for i, (row, col) in enumerate(playable_cells):
-            commands.append(SetCellValueCommand(row, col, start_num + i))
-        
-        batch_command = BatchCommand(commands, f"Number {len(commands)} cells starting from {start_num}")
-        success = self.grid.command_history.execute_command(batch_command, self.grid)
-        
+            self._show_current_number_highlight(row, col)
+            cmd = SetCellValueCommand(row, col, start_num + i)
+            if not live.add_and_execute(self.grid, cmd):
+                self._clear_current_number_highlight()
+                messagebox.showerror("Numbering Failed", "Could not set a value. Aborting.",
+                                    parent=self._dialog_parent())
+                live.undo(self.grid)
+                if hasattr(self.canvas, "_notify_grid_change"):
+                    self.canvas._notify_grid_change()
+                self.canvas.redraw_grid()
+                return False
+            if hasattr(self.canvas, "_notify_grid_change"):
+                self.canvas._notify_grid_change()
+            self.canvas.redraw_grid()
+        self._clear_current_number_highlight()
+
+        success = self.grid.command_history.execute_command(live, self.grid)
         if success:
-            end_num = start_num + len(commands) - 1
-            messagebox.showinfo("Custom Numbering", 
-                            f"Numbered {len(commands)} cells from {start_num} to {end_num}")
+            end_num = start_num + len(playable_cells) - 1
+            messagebox.showinfo(
+                "Custom Numbering",
+                f"Numbered {len(playable_cells)} cells from {start_num} to {end_num}",
+                parent=self._dialog_parent()
+            )
+            if hasattr(self.canvas, "_notify_grid_change"):
+                self.canvas._notify_grid_change()
+            self.canvas.redraw_grid()
         return success
-    
+
+    def _batch_number_by_selection_ask_each(self):
+        """Number cells by selection order, prompting for each value.
+        - Cancel → triage (Abort / Skip / Retry)
+        - Dialog stays on top
+        - Highlights current cell
+        - Live board updates after each accepted value
+        - Single undo step overall"""
+        if not self.selection_mode or not self.selected_cells:
+            return False
+
+        # Resolve playable cells in explicit selection order
+        playable_cells = []
+        for cell in self.selection_order:
+            if cell in self.selected_cells:
+                r, c = cell
+                state, _ = self.grid.get_cell_state(r, c)
+                if state in (CellState.EMPTY, CellState.PREFILLED):
+                    playable_cells.append((r, c))
+
+        if not playable_cells:
+            messagebox.showwarning("No Playable Cells", "No playable cells in selection.", parent=self._dialog_parent())
+            return False
+
+        max_val = getattr(self.grid, "get_max_possible_value", lambda: 999)()
+        try:
+            from core.commands import LiveBatchCommand
+        except Exception:
+            LiveBatchCommand = None
+
+        if LiveBatchCommand is None:
+            # Fallback without live updates or triage
+            commands = []
+            last_val = None
+            for (r, c) in playable_cells:
+                initial = (last_val + 1) if last_val is not None else 1
+                val = self._askinteger_topmost(
+                    "Number cell",
+                    f"Enter value for cell ({r},{c}):",
+                    minvalue=1, maxvalue=max_val, initialvalue=initial
+                )
+                if val is None:
+                    continue
+                commands.append(SetCellValueCommand(r, c, val))
+                last_val = val
+            if not commands:
+                return False
+            batch = BatchCommand(commands, f"Number {len(commands)} cells (ask individually)")
+            ok = self.grid.command_history.execute_command(batch, self.grid)
+            if ok:
+                self.canvas.redraw_grid()
+            return ok
+
+        live = LiveBatchCommand(f"Number {len(playable_cells)} cells (ask individually)")
+        last_val = None
+
+        for (r, c) in playable_cells:
+            self._show_current_number_highlight(r, c)
+            while True:
+                initial = (last_val + 1) if last_val is not None else 1
+                val = self._askinteger_topmost(
+                    "Number cell",
+                    f"Enter value for cell ({r},{c}):",
+                    minvalue=1, maxvalue=max_val, initialvalue=initial
+                )
+                if val is None:
+                    choice = self._askyesnocancel_topmost(
+                        "Abort numbering?",
+                        "Do you want to abort numbering?\n\n"
+                        "Yes = Abort and discard all changes so far\n"
+                        "No = Skip this cell and continue\n"
+                        "Cancel = Try again for this cell"
+                    )
+                    if choice is True:
+                        self._clear_current_number_highlight()
+                        live.undo(self.grid)
+                        if hasattr(self.canvas, "_notify_grid_change"):
+                            self.canvas._notify_grid_change()
+                        self.canvas.redraw_grid()
+                        return False
+                    elif choice is False:
+                        self._clear_current_number_highlight()
+                        break  # skip this cell
+                    else:
+                        continue  # retry same cell
+
+                cmd = SetCellValueCommand(r, c, val)
+                if not live.add_and_execute(self.grid, cmd):
+                    self._clear_current_number_highlight()
+                    messagebox.showerror("Numbering Failed", "Could not set this value. Aborting.",
+                                        parent=self._dialog_parent())
+                    live.undo(self.grid)
+                    if hasattr(self.canvas, "_notify_grid_change"):
+                        self.canvas._notify_grid_change()
+                    self.canvas.redraw_grid()
+                    return False
+                last_val = val
+                if hasattr(self.canvas, "_notify_grid_change"):
+                    self.canvas._notify_grid_change()
+                self.canvas.redraw_grid()
+                self._clear_current_number_highlight()
+                break  # next cell
+
+        if not getattr(live, "commands", None):
+            return False
+        ok = self.grid.command_history.execute_command(live, self.grid)
+        if ok:
+            if hasattr(self.canvas, "_notify_grid_change"):
+                self.canvas._notify_grid_change()
+            self.canvas.redraw_grid()
+        return ok
+
     def get_batch_operations_menu(self) -> Dict[str, Callable]:
         """Get available batch operations for selected cells."""
         if not self.selection_mode or not self.selected_cells:
@@ -528,9 +749,8 @@ class ConstraintEditor:
         
         # IMPROVED: Multiple numbering options
         if empty_cells > 0 or prefilled_cells > 0:
-            operations["Number by Selection Order"] = self._batch_number_by_selection_order
-            operations["Number by Position"] = self._batch_number_by_position
-            operations["Number Starting from..."] = self._batch_number_custom_start
+            operations["Number by selection order, starting from..."] = self._batch_number_custom_start
+            operations["Number by selection order (ask individually)"] = self._batch_number_by_selection_ask_each
             if prefilled_cells > 0:
                 operations["Clear All Numbers"] = self._batch_clear_numbers
         
